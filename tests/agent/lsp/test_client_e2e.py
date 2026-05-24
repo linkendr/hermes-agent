@@ -16,6 +16,10 @@ import pytest
 
 from agent.lsp.client import LSPClient
 
+# These tests intentionally spawn and terminate a mock LSP subprocess.
+# The live-system guard protects unrelated processes; bypass it here because
+# real signal delivery to this test-owned child is the behavior under test.
+pytestmark = pytest.mark.live_system_guard_bypass
 
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 

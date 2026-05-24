@@ -31,7 +31,15 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# Backward-compatible constant for callers that import it for display or
+# explicit paths. SessionDB() resolves its default dynamically at construction
+# time so tests/profile switches that update HERMES_HOME after import cannot
+# write to an import-time ~/.hermes/state.db snapshot.
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+
+
+def _default_db_path() -> Path:
+    return get_hermes_home() / "state.db"
 
 SCHEMA_VERSION = 13
 
@@ -332,7 +340,7 @@ class SessionDB:
     _CHECKPOINT_EVERY_N_WRITES = 50
 
     def __init__(self, db_path: Path = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or _default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.Lock()

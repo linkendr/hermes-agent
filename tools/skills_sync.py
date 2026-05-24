@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 MANIFEST_FILE = SKILLS_DIR / ".bundled_manifest"
+NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
 
 
 def _get_bundled_dir() -> Path:
@@ -172,6 +173,28 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def _empty_sync_result(**extra: object) -> dict:
+    """Return an empty sync result with the normal sync result keys."""
+    result = {
+        "copied": [],
+        "updated": [],
+        "skipped": 0,
+        "user_modified": [],
+        "cleaned": [],
+        "total_bundled": 0,
+    }
+    result.update(extra)
+    return result
+
+
+def _has_bundled_skills_opt_out() -> bool:
+    """Return True when the profile root opts out of bundled skill sync."""
+    try:
+        return (SKILLS_DIR.parent / NO_BUNDLED_SKILLS_MARKER).exists()
+    except OSError:
+        return False
+
+
 def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
@@ -179,13 +202,14 @@ def sync_skills(quiet: bool = False) -> dict:
     Returns:
         dict with keys: copied (list), updated (list), skipped (int),
                         user_modified (list), cleaned (list), total_bundled (int)
+                        plus skipped_opt_out (bool) when the profile opted out.
     """
+    if _has_bundled_skills_opt_out():
+        return _empty_sync_result(skipped_opt_out=True)
+
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
-        return {
-            "copied": [], "updated": [], "skipped": 0,
-            "user_modified": [], "cleaned": [], "total_bundled": 0,
-        }
+        return _empty_sync_result()
 
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     manifest = _read_manifest()

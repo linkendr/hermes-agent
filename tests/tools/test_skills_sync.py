@@ -200,6 +200,29 @@ class TestSyncSkills:
         stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
         return stack
 
+    def test_opt_out_marker_skips_before_creating_skills_dir_or_manifest(self, tmp_path):
+        bundled = self._setup_bundled(tmp_path)
+        profile_dir = tmp_path / "profile"
+        profile_dir.mkdir()
+        (profile_dir / ".no-bundled-skills").write_text("opted out\n")
+        skills_dir = profile_dir / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert result == {
+            "copied": [],
+            "updated": [],
+            "skipped": 0,
+            "user_modified": [],
+            "cleaned": [],
+            "total_bundled": 0,
+            "skipped_opt_out": True,
+        }
+        assert not skills_dir.exists()
+        assert not manifest_file.exists()
+
     def test_fresh_install_copies_all(self, tmp_path):
         bundled = self._setup_bundled(tmp_path)
         skills_dir = tmp_path / "user_skills"
@@ -483,7 +506,9 @@ class TestSyncSkills:
         assert "hermes skills reset new-skill" in captured
 
     def test_nonexistent_bundled_dir(self, tmp_path):
-        with patch("tools.skills_sync._get_bundled_dir", return_value=tmp_path / "nope"):
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        with self._patches(tmp_path / "nope", skills_dir, manifest_file):
             result = sync_skills(quiet=True)
         assert result == {
             "copied": [], "updated": [], "skipped": 0,

@@ -2747,6 +2747,418 @@ def test_default_spawn_auto_loads_kanban_worker_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def test_default_spawn_skips_task_skills_missing_from_profile_home(kanban_home, monkeypatch):
+    """Per-task skill preload must not crash workers whose profile lacks it."""
+    captured = {}
+
+    class FakeProc:
+        pid = 99998
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env", {})
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda _profile: str(kanban_home / "profiles" / "worker"),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="missing task skill",
+            assignee="worker",
+            skills=["goal-kanban-specification-review", "kanban-board-design"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(workspace))
+        assert pid == 99998
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    assert "goal-kanban-specification-review" not in cmd
+    assert "kanban-board-design" not in cmd
+    assert "--skills" not in cmd
+
+
+def test_default_spawn_loads_task_skill_when_profile_home_has_it(kanban_home, monkeypatch):
+    """Resolvable task-local skills should still be preloaded."""
+    profile_home = kanban_home / "profiles" / "worker"
+    skill_dir = profile_home / "skills" / "custom-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: custom-skill\n---\n# Custom\n")
+    captured = {}
+
+    class FakeProc:
+        pid = 99997
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda _profile: str(profile_home),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="available task skill",
+            assignee="worker",
+            skills=["custom-skill"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(workspace))
+        assert pid == 99997
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    assert "--skills" in cmd
+    assert cmd[cmd.index("--skills") + 1] == "custom-skill"
+
+
+def test_default_spawn_loads_task_skill_from_profile_external_dir(kanban_home, monkeypatch):
+    """Skill availability should honor profile skills.external_dirs."""
+    profile_home = kanban_home / "profiles" / "worker"
+    external_skill = kanban_home / "shared-skills" / "devops" / "kanban-board-design"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text(
+        "---\nname: kanban-board-design\ndescription: Board design\n---\n# Board\n"
+    )
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n    - " + str(external_skill) + "\n"
+    )
+    captured = {}
+
+    class FakeProc:
+        pid = 99996
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda _profile: str(profile_home),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="external task skill",
+            assignee="worker",
+            skills=["kanban-board-design"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(workspace))
+        assert pid == 99996
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    assert "--skills" in cmd
+    assert cmd[cmd.index("--skills") + 1] == "kanban-board-design"
+
+
+def test_skill_available_for_home_rejects_ambiguous_skill_collision(kanban_home):
+    """The dispatcher gate must mirror CLI --skills ambiguity handling."""
+    profile_home = kanban_home / "profiles" / "worker"
+    local_skill = profile_home / "skills" / "dupe-skill"
+    external_skill = kanban_home / "shared-skills" / "devops" / "dupe-skill"
+    local_skill.mkdir(parents=True)
+    external_skill.mkdir(parents=True)
+    (local_skill / "SKILL.md").write_text(
+        "---\nname: dupe-skill\ndescription: Local\n---\n# Local\n"
+    )
+    (external_skill / "SKILL.md").write_text(
+        "---\nname: dupe-skill\ndescription: External\n---\n# External\n"
+    )
+    (profile_home / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n    - " + str(kanban_home / "shared-skills") + "\n"
+    )
+
+    assert kb._skill_available_for_home(str(profile_home), "dupe-skill") is False
+
+
+def test_kanban_worker_skill_available_rejects_bare_identifier_ambiguity(kanban_home):
+    """The built-in gate must validate the same bare name _default_spawn emits."""
+    profile_home = kanban_home / "profiles" / "worker"
+    canonical = profile_home / "skills" / "devops" / "kanban-worker"
+    duplicate = kanban_home / "shared-skills" / "other" / "kanban-worker"
+    canonical.mkdir(parents=True)
+    duplicate.mkdir(parents=True)
+    (canonical / "SKILL.md").write_text(
+        "---\nname: kanban-worker\ndescription: Worker\n---\n# Worker\n"
+    )
+    (duplicate / "SKILL.md").write_text(
+        "---\nname: kanban-worker\ndescription: Duplicate\n---\n# Duplicate\n"
+    )
+    (profile_home / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n    - " + str(kanban_home / "shared-skills") + "\n"
+    )
+
+    assert kb._skill_available_for_home(str(profile_home), "devops/kanban-worker") is True
+    assert kb._skill_available_for_home(str(profile_home), "kanban-worker") is False
+    assert kb._kanban_worker_skill_available(str(profile_home)) is False
+
+
+def test_default_spawn_preserves_explicit_canonical_kanban_worker_skill(kanban_home, monkeypatch):
+    """An explicit canonical worker skill must not be dropped when bare auto-load is ambiguous."""
+    profile_home = kanban_home / "profiles" / "worker"
+    canonical = profile_home / "skills" / "devops" / "kanban-worker"
+    duplicate = kanban_home / "shared-skills" / "other" / "kanban-worker"
+    canonical.mkdir(parents=True)
+    duplicate.mkdir(parents=True)
+    (canonical / "SKILL.md").write_text(
+        "---\nname: kanban-worker\ndescription: Worker\n---\n# Worker\n"
+    )
+    (duplicate / "SKILL.md").write_text(
+        "---\nname: kanban-worker\ndescription: Duplicate\n---\n# Duplicate\n"
+    )
+    (profile_home / "config.yaml").write_text(
+        "skills:\n  external_dirs:\n    - " + str(kanban_home / "shared-skills") + "\n"
+    )
+    captured = {}
+
+    class FakeProc:
+        pid = 99995
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda _profile: str(profile_home),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="canonical kanban-worker task skill",
+            assignee="worker",
+            skills=["devops/kanban-worker"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(workspace))
+        assert pid == 99995
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    assert "kanban-worker" not in cmd
+    assert "--skills" in cmd
+    assert cmd[cmd.index("--skills") + 1] == "devops/kanban-worker"
+
+
+def test_skill_available_for_home_accepts_plugin_qualified_skill(kanban_home):
+    """The dispatcher gate must preserve valid plugin-qualified --skills names."""
+    profile_home = kanban_home / "profiles" / "worker"
+    plugin_dir = profile_home / "plugins" / "proof_plugin"
+    plugin_dir.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - proof_plugin\n"
+    )
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: proof_plugin\nversion: 0.0.1\n"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "def register(ctx):\n"
+        "    ctx.register_skill('audit', Path(__file__).with_name('SKILL.md'))\n"
+    )
+    (plugin_dir / "SKILL.md").write_text(
+        "---\nname: audit\ndescription: Plugin audit\n---\n# Audit\n"
+    )
+
+    assert kb._skill_available_for_home(str(profile_home), "proof_plugin:audit") is True
+
+
+def test_skill_available_for_home_rejects_missing_plugin_skill_before_local_fallback(kanban_home):
+    """If a plugin namespace exists, missing plugin skills must not fall through locally."""
+    profile_home = kanban_home / "profiles" / "worker"
+    plugin_dir = profile_home / "plugins" / "proof_plugin"
+    local_fallback = profile_home / "skills" / "proof_plugin" / "missing"
+    plugin_dir.mkdir(parents=True)
+    local_fallback.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - proof_plugin\n"
+    )
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: proof_plugin\nversion: 0.0.1\n"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "def register(ctx):\n"
+        "    ctx.register_skill('audit', Path(__file__).with_name('SKILL.md'))\n"
+    )
+    (plugin_dir / "SKILL.md").write_text(
+        "---\nname: audit\ndescription: Plugin audit\n---\n# Audit\n"
+    )
+    (local_fallback / "SKILL.md").write_text(
+        "---\nname: missing\ndescription: Local fallback\n---\n# Missing\n"
+    )
+
+    assert kb._skill_available_for_home(str(profile_home), "proof_plugin:missing") is False
+
+
+def test_skill_available_for_home_uses_worker_cwd_for_project_plugin(
+    kanban_home, tmp_path, monkeypatch
+):
+    """Project plugin skills must be resolved from the worker cwd, not dispatcher cwd."""
+    profile_home = kanban_home / "profiles" / "worker"
+    workspace = kanban_home / "workspaces" / "project-plugin-task"
+    plugin_dir = workspace / ".hermes" / "plugins" / "proof_plugin"
+    unrelated_cwd = tmp_path / "dispatcher"
+    plugin_dir.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    unrelated_cwd.mkdir()
+    workspace.mkdir(exist_ok=True)
+    (profile_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - proof_plugin\n"
+    )
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: proof_plugin\nversion: 0.0.1\n"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "def register(ctx):\n"
+        "    ctx.register_skill('audit', Path(__file__).with_name('SKILL.md'))\n"
+    )
+    (plugin_dir / "SKILL.md").write_text(
+        "---\nname: audit\ndescription: Project plugin audit\n---\n# Audit\n"
+    )
+    monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "true")
+    monkeypatch.chdir(unrelated_cwd)
+
+    assert kb._skill_available_for_home(str(profile_home), "proof_plugin:audit") is False
+    assert (
+        kb._skill_available_for_home(
+            str(profile_home), "proof_plugin:audit", cwd=str(workspace)
+        )
+        is True
+    )
+
+
+def test_default_spawn_preserves_project_plugin_skill_from_worker_cwd(
+    kanban_home, tmp_path, monkeypatch
+):
+    """The spawn gate must not drop project plugin skills loadable in worker cwd."""
+    profile_home = kanban_home / "profiles" / "worker"
+    workspace = kanban_home / "workspaces" / "project-plugin-task"
+    unrelated_cwd = tmp_path / "dispatcher"
+    plugin_dir = workspace / ".hermes" / "plugins" / "proof_plugin"
+    plugin_dir.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    unrelated_cwd.mkdir()
+    workspace.mkdir(exist_ok=True)
+    (profile_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - proof_plugin\n"
+    )
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: proof_plugin\nversion: 0.0.1\n"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "def register(ctx):\n"
+        "    ctx.register_skill('audit', Path(__file__).with_name('SKILL.md'))\n"
+    )
+    (plugin_dir / "SKILL.md").write_text(
+        "---\nname: audit\ndescription: Project plugin audit\n---\n# Audit\n"
+    )
+    monkeypatch.setenv("HERMES_ENABLE_PROJECT_PLUGINS", "true")
+    monkeypatch.chdir(unrelated_cwd)
+    captured = {}
+
+    class FakeProc:
+        pid = 99996
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["cwd"] = kwargs.get("cwd")
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda _profile: str(profile_home),
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="project plugin task skill",
+            assignee="worker",
+            workspace_kind="dir",
+            workspace_path=str(workspace),
+            skills=["proof_plugin:audit"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        resolved_workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(resolved_workspace))
+        assert pid == 99996
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    assert captured["cwd"] == str(workspace)
+    assert "--skills" in cmd
+    assert cmd[cmd.index("--skills") + 1] == "proof_plugin:audit"
+
+
+def test_skill_available_for_home_rejects_platform_incompatible_skill(kanban_home):
+    """A visible SKILL.md is not loadable if skill_view would reject platform."""
+    profile_home = kanban_home / "profiles" / "worker"
+    skill_dir = profile_home / "skills" / "windows-only"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: windows-only\ndescription: Windows only\nplatforms: [windows]\n---\n# Windows\n"
+    )
+
+    assert kb._skill_available_for_home(str(profile_home), "windows-only") is False
+
+
+def test_skill_available_for_home_rejects_disabled_skill(kanban_home):
+    """Disabled profile-local skills are not CLI-loadable via --skills."""
+    profile_home = kanban_home / "profiles" / "worker"
+    skill_dir = profile_home / "skills" / "disabled-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: disabled-skill\ndescription: Disabled\n---\n# Disabled\n"
+    )
+    (profile_home / "config.yaml").write_text(
+        "skills:\n  disabled:\n    - disabled-skill\n"
+    )
+
+    assert kb._skill_available_for_home(str(profile_home), "disabled-skill") is False
+
+
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
     """A task runtime cap should raise the worker's terminal default.
 
@@ -2976,6 +3388,7 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     """Dispatcher argv must carry one `--skills X` pair per task skill,
     in addition to the built-in kanban-worker."""
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
+    monkeypatch.setattr(kb, "_skill_available_for_home", lambda _h, _skill, **_kwargs: True)
     captured = {}
 
     class FakeProc:
@@ -3026,6 +3439,7 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
 def test_default_spawn_dedupes_kanban_worker_from_task_skills(kanban_home, monkeypatch):
     """If a task explicitly lists 'kanban-worker', we don't double-pass it."""
     monkeypatch.setattr(kb, "_kanban_worker_skill_available", lambda _h: True)
+    monkeypatch.setattr(kb, "_skill_available_for_home", lambda _h, _skill, **_kwargs: True)
     captured = {}
 
     class FakeProc:

@@ -5421,39 +5421,204 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
-def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
-    """True if the bundled ``kanban-worker`` skill resolves for the home the
-    spawned worker will run under.
+def _skill_available_for_home(
+    hermes_home: Optional[str],
+    skill_name: str,
+    *,
+    cwd: Optional[str] = None,
+) -> bool:
+    """True if ``skill_name`` is loadable by ``hermes --skills`` for a worker home.
 
-    The dispatcher injects ``--skills kanban-worker`` into every worker. When
-    the worker activates a profile (``hermes -p <name>``), its ``SKILLS_DIR``
-    becomes ``<profile_home>/skills`` — which on many profiles does NOT contain
-    the bundled skill (it ships in the *default* root home, not every
-    profile-scoped skills dir). Preloading a missing skill is fatal at CLI
-    startup (``ValueError: Unknown skill(s): kanban-worker``), aborting the
-    worker before the agent loop runs. Gate the flag on actual resolvability;
-    the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
-    omitting the flag only drops the supplementary pattern library.
+    This intentionally mirrors ``agent.skill_commands.build_preloaded_skills_prompt``
+    / ``tools.skills_tool.skill_view`` lookup semantics closely enough for the
+    dispatcher gate: one unambiguous candidate, compatible platform, and not
+    disabled in the worker profile config. Returning true for a merely-present
+    SKILL.md is unsafe because a later CLI ambiguity/platform/disabled rejection
+    raises ``ValueError: Unknown skill(s): ...`` before the worker can start.
     """
+    import os as _os
     from pathlib import Path as _Path
 
-    # An unset HERMES_HOME means the worker falls back to the default root
-    # home (``~/.hermes``), which ships the bundled skill.
-    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    skills_root = base / "skills"
-    if not skills_root.is_dir():
+    from agent.skill_utils import (
+        iter_skill_index_files,
+        is_valid_namespace,
+        parse_qualified_name,
+        parse_frontmatter,
+        skill_matches_platform,
+        yaml_load,
+    )
+
+    name = str(skill_name or "").strip().strip("/")
+    if not name:
         return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
+
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    cfg_path = base / "config.yaml"
+    parsed_cfg: Any = None
+    if cfg_path.is_file():
+        try:
+            parsed_cfg = yaml_load(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            parsed_cfg = None
+    skills_cfg = parsed_cfg.get("skills") if isinstance(parsed_cfg, dict) else None
+
+    roots: list[_Path] = [base / "skills"]
+    raw_dirs = skills_cfg.get("external_dirs") if isinstance(skills_cfg, dict) else None
+    if isinstance(raw_dirs, str):
+        raw_dirs = [raw_dirs]
+    if isinstance(raw_dirs, list):
+        for entry in raw_dirs:
+            entry = str(entry or "").strip()
+            if not entry:
+                continue
+            expanded = _os.path.expanduser(_os.path.expandvars(entry))
+            p = _Path(expanded)
+            if not p.is_absolute():
+                p = base / p
+            roots.append(p)
+
+    candidates: list[tuple[_Path | None, _Path]] = []
+    seen_md: set[_Path] = set()
+
+    def _plugin_skill_available() -> bool | None:
+        """Return plugin-qualified availability, or None to fall through locally."""
+        if ":" not in name:
+            return None
+        namespace, bare = parse_qualified_name(name)
+        if not is_valid_namespace(namespace) or not bare:
+            return False
+        old_home = _os.environ.get("HERMES_HOME")
+        old_cwd = _os.getcwd()
+        namespace_skills: list[str] = []
+        try:
+            _os.environ["HERMES_HOME"] = str(base)
+            if cwd:
+                _os.chdir(cwd)
+            from hermes_cli.plugins import PluginManager
+
+            manager = PluginManager()
+            manager.discover_and_load(force=True)
+            plugin_skill_md = manager.find_plugin_skill(name)
+            namespace_skills = manager.list_plugin_skills(str(namespace))
+        except Exception:
+            plugin_skill_md = None
+            namespace_skills = []
+        finally:
+            if cwd:
+                _os.chdir(old_cwd)
+            if old_home is None:
+                _os.environ.pop("HERMES_HOME", None)
+            else:
+                _os.environ["HERMES_HOME"] = old_home
+        if plugin_skill_md is None:
+            return False if namespace_skills else None
+        if not plugin_skill_md.exists():
+            return False
+        try:
+            frontmatter, _ = parse_frontmatter(plugin_skill_md.read_text(encoding="utf-8"))
+        except Exception:
+            frontmatter = {}
+        return skill_matches_platform(frontmatter)
+
+    plugin_available = _plugin_skill_available()
+    if plugin_available is not None:
+        return plugin_available
+
+    def _record(skill_dir: _Path | None, skill_md: _Path) -> None:
+        try:
+            key = skill_md.resolve()
+        except OSError:
+            key = skill_md
+        if key in seen_md:
+            return
+        seen_md.add(key)
+        candidates.append((skill_dir, skill_md))
+
+    local_category_name: str | None = None
+    if ":" in name:
+        namespace, _, bare = name.partition(":")
+        if namespace and bare:
+            local_category_name = f"{namespace}/{bare}"
+
+    seen_roots: set[_Path] = set()
+    for root in roots:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        if root in seen_roots or not root.is_dir():
+            continue
+        seen_roots.add(root)
+
+        direct_path = root / name
+        if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+            _record(direct_path, direct_path / "SKILL.md")
+        elif direct_path.with_suffix(".md").exists():
+            _record(None, direct_path.with_suffix(".md"))
+
+        if local_category_name:
+            categorized_path = root / local_category_name
+            if categorized_path.is_dir() and (categorized_path / "SKILL.md").exists():
+                _record(categorized_path, categorized_path / "SKILL.md")
+            elif categorized_path.with_suffix(".md").exists():
+                _record(None, categorized_path.with_suffix(".md"))
+
+        try:
+            for found_skill_md in iter_skill_index_files(root, "SKILL.md"):
+                if found_skill_md.parent.name == name:
+                    _record(found_skill_md.parent, found_skill_md)
+        except OSError:
+            continue
+
+        try:
+            for found_md in root.rglob(f"{name}.md"):
+                if found_md.name != "SKILL.md":
+                    _record(None, found_md)
+        except OSError:
+            continue
+
+    if len(candidates) != 1:
+        return False
+
+    skill_dir, skill_md = candidates[0]
+    if not skill_md.exists():
+        return False
     try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
-    except OSError:
-        pass
-    return False
+        frontmatter, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+    except Exception:
+        frontmatter = {}
+    if not skill_matches_platform(frontmatter):
+        return False
+
+    def _normalize_string_set(values: Any) -> set[str]:
+        if values is None:
+            return set()
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, Iterable):
+            return set()
+        return {str(v).strip() for v in values if str(v).strip()}
+
+    disabled: set[str] = set()
+    if isinstance(skills_cfg, dict):
+        platform = _os.getenv("HERMES_PLATFORM") or _os.getenv("HERMES_SESSION_PLATFORM")
+        platform_disabled = None
+        if platform and isinstance(skills_cfg.get("platform_disabled"), dict):
+            platform_disabled = skills_cfg["platform_disabled"].get(platform)
+        disabled = _normalize_string_set(
+            platform_disabled if platform_disabled is not None else skills_cfg.get("disabled")
+        )
+    resolved_name = str(frontmatter.get("name") or (skill_dir.name if skill_dir else skill_md.stem)).strip()
+    if resolved_name in disabled or name in disabled:
+        return False
+    return True
+
+
+def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
+    """True if the auto-preloaded ``kanban-worker`` skill resolves for a worker home."""
+    # _default_spawn emits the bare identifier below. Gate the exact same string
+    # the child CLI will load so ambiguity checks cannot drift.
+    return _skill_available_for_home(hermes_home, "kanban-worker")
 
 
 def _worker_terminal_timeout_env(
@@ -5597,19 +5762,29 @@ def _default_spawn(
     # profile-scoped skills dirs, and preloading a missing skill is
     # fatal at CLI startup. Omitting it is safe — the lifecycle
     # contract still ships via KANBAN_GUIDANCE.
+    preloaded_skills: set[str] = set()
     if _kanban_worker_skill_available(env.get("HERMES_HOME")):
         cmd.extend(["--skills", "kanban-worker"])
+        preloaded_skills.add("kanban-worker")
     # Per-task force-loaded skills. Each name goes in its own
     # `--skills X` pair rather than a single comma-joined arg: the CLI
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
     # Dedupe against the built-in so we don't double-load kanban-worker
-    # if a task author asks for it explicitly.
+    # if a task author asks for it explicitly. Gate task-local skills on
+    # the worker's profile-scoped HERMES_HOME too; otherwise one missing
+    # specialist skill aborts the whole worker before the lifecycle prompt
+    # can run.
     if task.skills:
         for sk in task.skills:
-            if sk and sk != "kanban-worker":
+            if (
+                sk
+                and sk not in preloaded_skills
+                and _skill_available_for_home(env.get("HERMES_HOME"), sk, cwd=workspace)
+            ):
                 cmd.extend(["--skills", sk])
+                preloaded_skills.add(sk)
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     cmd.extend([

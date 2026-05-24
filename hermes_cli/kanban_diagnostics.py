@@ -689,13 +689,16 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
-            # A success (or manual reclaim) breaks the streak.
+        elif outcome in {"completed", "reclaimed", "blocked"}:
+            # A success, manual reclaim, or explicit blocked/handled run
+            # breaks the visible crash streak. Otherwise intentionally
+            # blocked tasks keep showing stale crash diagnostics after the
+            # operator has already held them.
             break
         else:
-            # Other outcomes (timed_out, blocked, spawn_failed, gave_up)
-            # aren't crash signals — don't count them, but they also
-            # don't break the crash streak.
+            # Other outcomes (timed_out, spawn_failed, gave_up) aren't
+            # crash signals — don't count them, but they also don't break
+            # the crash streak.
             continue
     if consecutive < threshold:
         return []
